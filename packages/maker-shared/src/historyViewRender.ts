@@ -2,6 +2,32 @@ import { historyViewLeaves, historyWorkSummaries, type HistoryFileArtifact, type
 import type { HistoryViewController, HistoryViewSnapshot } from './historyViewController.js';
 import { liveContentWithHistoryOrder } from './historyViewHandoff.js';
 
+/** A real user row that closes the previous turn. Steers and internal dispatches stay inside it. */
+function isLiveTurnBoundary(row: HistoryMessageSource): boolean {
+  if (row.role !== 'user') return false;
+  const extra = row as HistoryMessageSource & {
+    delivery?: unknown;
+    isSyntheticTrigger?: boolean;
+    automationOrigin?: unknown;
+    parentToolUseId?: unknown;
+  };
+  if (extra.isSyntheticTrigger === true || extra.automationOrigin != null || extra.parentToolUseId) return false;
+  if (extra.delivery === 'steer') return false;
+  const meta = row.agentMeta as {
+    delivery?: unknown;
+    autoResume?: unknown;
+    origin?: unknown;
+    hookSource?: unknown;
+    parentUuid?: unknown;
+    parentToolUseId?: unknown;
+  } | null | undefined;
+  if (meta?.delivery === 'steer' || meta?.hookSource != null) return false;
+  if (meta?.autoResume === true || meta?.origin != null) return false;
+  if (typeof meta?.parentUuid === 'string' && meta.parentUuid) return false;
+  if (typeof meta?.parentToolUseId === 'string' && meta.parentToolUseId) return false;
+  return true;
+}
+
 /** The original renderer owns all grouping. References only substitute unread bodies. */
 export function renderHistoryView<T extends HistoryMessageSource, TItem>(options: {
   view: HistoryViewController<T>;
@@ -96,6 +122,8 @@ export function renderHistoryView<T extends HistoryMessageSource, TItem>(options
     }
     endMs = Math.max(endMs, summary.endedAtMs);
   }
+  // Snapshot ids only. Live rows appended below must not move this cursor.
+  const absorbedIds = new Set(seen);
   // Durable pushes can change a pending row's provisional timestamp before the
   // history page includes it. Preserve the handoff's observation order for those
   // rows, without moving other live rows or changing authoritative history order.
@@ -115,13 +143,29 @@ export function renderHistoryView<T extends HistoryMessageSource, TItem>(options
   // Local pending/blocked user bubbles and ephemeral UI rows belong to the
   // current UI store, not persisted history. Anchor them to the reordered slots,
   // without trusting device clocks or changing their order relative to each other.
+  let historyCursor = -1;
+  for (let index = 0; index < orderedLiveMessages.length; index += 1) {
+    if (absorbedIds.has(orderedLiveMessages[index].clientId)) historyCursor = index;
+  }
   const renderedIds = new Set(rows.map((row) => row.clientId));
+  const liveAfter = new Array<boolean>(orderedLiveMessages.length);
+  let liveAhead = false;
+  for (let index = orderedLiveMessages.length - 1; index >= 0; index -= 1) {
+    liveAfter[index] = liveAhead;
+    const candidate = orderedLiveMessages[index];
+    if (isLive(candidate) && renderedIds.has(candidate.clientId)) liveAhead = true;
+  }
+
   let beforeClientId: string | undefined;
   for (let index = orderedLiveMessages.length - 1; index >= 0; index--) {
     const row = orderedLiveMessages[index];
     if (renderedIds.has(row.clientId)) {
       beforeClientId = row.clientId;
-    } else if ((row.role === 'user' && options.isLocalUser?.(row)) || options.isLocalMessage?.(row)) {
+    } else if ((row.role === 'user' && options.isLocalUser?.(row)) || options.isLocalMessage?.(row)
+      // The history page can still be showing the previous run when the next user
+      // turn is already in the live store. Insert that boundary so the old preview
+      // and its timer are not reused above the new task.
+      || (historyCursor >= 0 && index > historyCursor && liveAfter[index] === true && isLiveTurnBoundary(row))) {
       const before = beforeClientId === undefined ? -1 : rows.findIndex((item) => item.clientId === beforeClientId);
       rows.splice(before < 0 ? rows.length : before, 0, row);
       renderedIds.add(row.clientId);
@@ -159,7 +203,21 @@ export function renderHistoryView<T extends HistoryMessageSource, TItem>(options
         if (summary.preview) view.setExpanded(summary.preview.key, !full && preview);
       }
     };
-    const lines = [...summaries].reverse().find((summary) => summary.lines)?.lines;
+    // Lines belong to one running summary. A row that arrives after that summary
+    // is the next turn, and must not keep the previous preview on screen.
+    const lineSummary = [...summaries].reverse().find((summary) => summary.isStreaming && summary.lines);
+    let lines = lineSummary?.lines;
+    if (lineSummary && lines) {
+      const ownedByLine = (id: string) => references.get(id) === lineSummary;
+      let sawLine = false;
+      for (const child of children) {
+        if (structure.children(child)) continue;
+        const ids = structure.sourceIds(child);
+        if (ids.length === 0) continue;
+        if (ids.every(ownedByLine)) sawLine = true;
+        else if (sawLine) { lines = undefined; break; }
+      }
+    }
     return structure.rebuild(item, next, {
       owner: view, key: summaries.map((summary) => summary.key).join('|'), expanded,
       revision: summaries.map((summary) => summary.revision).join('|'),

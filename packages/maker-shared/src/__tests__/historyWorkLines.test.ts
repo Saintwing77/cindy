@@ -177,6 +177,29 @@ describe('HistoryViewController.applyWorkPatch', () => {
     expect(items[0].deferred?.lines).toEqual([{ kind: 'thinking', key: 'c9', text: 'next' }]);
   });
 
+  it('drops the running preview when a later row is not part of that summary', async () => {
+    const { view } = await fixture();
+    view.applyWorkPatch(patch('r1', 'r2'));
+    type Item = { key: string; ids: string[]; children?: Item[]; deferred?: { lines?: unknown } };
+    const items = renderHistoryView<HistoryMessageSource, Item>({
+      view, snapshot: view.getSnapshot(), liveMessages: [], streaming: true,
+      build: (rows) => [{
+        key: 'work', ids: [],
+        children: [
+          ...rows.map((r) => ({ key: r.clientId, ids: [r.clientId] })),
+          { key: 'later', ids: ['later-row'] },
+        ],
+      }],
+      structure: {
+        placeholder: (value) => row('thinking', '', { clientId: `placeholder-${value.key}` }),
+        children: (item) => item.children,
+        sourceIds: (item) => item.ids,
+        rebuild: (item, children, deferred) => ({ ...item, children, deferred }),
+      },
+    });
+    expect(items[0].deferred?.lines).toBeUndefined();
+  });
+
   it('reports a group as awaiting details until its first detail rows land', async () => {
     const { view, transport } = await fixture();
     let finish!: (value: HistoryDetailPage<HistoryMessageSource>) => void;

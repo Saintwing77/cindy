@@ -177,7 +177,7 @@ export class HistoryViewController<T extends HistoryMessageSource> {
         // Completed outer groups can replace the running top-level key while
         // retaining its exact source start. Never infer a prefix from a later overlap.
         // Only retain a prefix with a proven overlap. Reset/rewind cannot leave an island.
-        if (boundary > 0) items = [...this.state.items.slice(0, boundary), ...items];
+        if (boundary > 0) items = [...this.state.items.slice(0, boundary).map(sealAbandonedRunningWork), ...items];
       }
       const retainedPrefix = !older && items.length > page.items.length;
       // A background validation of the same page must not replace rendering
@@ -371,4 +371,28 @@ export class HistoryViewController<T extends HistoryMessageSource> {
     this.sendIntent();
     if (this.active) void this.refresh();
   }
+}
+
+
+/** A newer page moved past this item. Only the latest tail is running, so a streaming
+ *  flag retained in the prefix would keep the previous task's preview and timer visible. */
+function sealAbandonedRunningWork<T extends HistoryMessageSource>(item: HistoryViewItem<T>): HistoryViewItem<T> {
+  if (item.type !== 'work') return item;
+  const sealedChildren = item.children?.map(sealAbandonedRunningWork);
+  const children = sealedChildren && item.children
+    && sealedChildren.every((child, index) => child === item.children?.[index])
+    ? item.children
+    : sealedChildren;
+  let summary = item.summary;
+  if (summary.isStreaming || summary.lines || summary.preview?.isStreaming || summary.preview?.lines) {
+    summary = { ...summary, isStreaming: false };
+    delete summary.lines;
+    if (summary.preview) {
+      const preview = { ...summary.preview, isStreaming: false };
+      delete preview.lines;
+      summary = { ...summary, preview };
+    }
+  }
+  if (summary === item.summary && children === item.children) return item;
+  return { ...item, summary, ...(children ? { children } : {}) };
 }

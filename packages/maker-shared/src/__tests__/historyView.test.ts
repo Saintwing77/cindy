@@ -604,6 +604,55 @@ describe('shared history view lifecycle', () => {
     expect(rendered).toEqual(['complete thinking', 'latest answer']);
   });
 
+  it('places a newer real user turn before live work the history page has not absorbed', async () => {
+    const known = row(1, 'user', 'old task');
+    const thought = row(2, 'thinking', 'old plan');
+    const view = new HistoryViewController<HistoryMessageSource>({
+      page: async () => ({ version: 1, items: projectHistoryView([known, thought], true), hasMore: false, nextCursor: null }),
+      details: async () => ({ version: 1, messages: [], hasMore: false, nextCursor: null }),
+      expanded: async () => undefined,
+    });
+    await view.refresh();
+    const nextUser = row(3, 'user', 'new task');
+    const nextThought = row(4, 'thinking', 'new plan');
+    const output = renderHistoryView({
+      view, snapshot: view.getSnapshot(), liveMessages: [known, thought, nextUser, nextThought], streaming: true,
+      isLive: (message) => message.clientId === nextThought.clientId,
+      build: (rows) => rows.map((item) => item.clientId), structure: ungroupedStructure,
+    });
+    const userAt = output.indexOf(nextUser.clientId);
+    const thoughtAt = output.indexOf(nextThought.clientId);
+    expect(userAt).toBeGreaterThan(output.indexOf(known.clientId));
+    expect(userAt).toBeLessThan(thoughtAt);
+    view.setActive(false);
+  });
+
+  it('seals a running preview left behind once a newer page moves past it', async () => {
+    const running = {
+      type: 'work' as const, key: 'work-old',
+      summary: {
+        key: 'work-old', firstMessageId: 'old-1', lastMessageId: 'old-2', startedAtMs: 1, endedAtMs: 2,
+        isStreaming: true, messageCount: 1, toolCount: 0, revision: 'r1',
+        lines: [{ kind: 'thinking' as const, key: 'line', text: 'old plan' }],
+      },
+    };
+    const newer = { type: 'messages' as const, key: 'c9', messages: [row(9, 'user', 'next')] };
+    const read = vi.fn(async () => ({ version: 1 as const, items: [running, newer], hasMore: true, nextCursor: 'latest' }));
+    const view = new HistoryViewController<HistoryMessageSource>({
+      page: read,
+      details: async () => ({ version: 1, messages: [], hasMore: false, nextCursor: null }),
+      expanded: async () => undefined,
+    });
+    await view.refresh();
+    read.mockResolvedValueOnce({ version: 1, items: [newer], hasMore: true, nextCursor: 'next' });
+    await view.refresh();
+    const [kept, next] = view.getSnapshot().items;
+    expect(kept).toMatchObject({ type: 'work', summary: { isStreaming: false, key: 'work-old' } });
+    expect(kept.type === 'work' && kept.summary.lines).toBeUndefined();
+    expect(next).toMatchObject({ key: 'c9' });
+    view.setActive(false);
+  });
+
   it('loads a collapsed work range for recovery without changing expansion state', async () => {
     const target = row(1, 'thinking', 'authoritative terminal');
     const details = vi.fn(async () => ({ version: 1 as const, messages: [target], hasMore: false, nextCursor: null }));
